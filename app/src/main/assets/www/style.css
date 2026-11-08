@@ -1,0 +1,144 @@
+/* Sized in vh so it reads the same from the sofa at 1080p or 4K.
+   Everything stays inside a 5% margin for TVs that overscan. */
+:root {
+  --ink: #f4ecff;
+  --muted: #b9a9dd;
+  --gold: #e2b75d;
+  --panel: rgba(16, 10, 34, 0.62);
+  --serif: Georgia, 'Noto Serif', 'Droid Serif', serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0820;
+  color: var(--ink);
+  font-family: var(--serif);
+  cursor: none;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#title {
+  position: fixed;
+  top: 5vh;
+  left: 5vw;
+  pointer-events: none;
+}
+
+#title h1 {
+  margin: 0;
+  font-size: 4.2vh;
+  font-weight: normal;
+  letter-spacing: 0.35em;
+  text-transform: uppercase;
+  color: var(--gold);
+  text-shadow: 0 0 2vh rgba(226, 183, 93, 0.45);
+}
+
+#status {
+  position: fixed;
+  left: 50%;
+  bottom: 5vh;
+  transform: translateX(-50%);
+  max-width: 90vw;
+  padding: 1.4vh 3vh;
+  border-radius: 999px;
+  background: var(--panel);
+  backdrop-filter: blur(6px);
+  text-align: center;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+#status-main { font-size: 3vh; }
+#status-sub { margin-top: 0.4vh; font-size: 2vh; color: var(--muted); }
+#status-sub:empty { display: none; }
+
+body.empty #status-main { animation: glow 2.4s ease-in-out infinite; }
+
+@keyframes glow {
+  0%, 100% { text-shadow: 0 0 0 transparent; }
+  50% { text-shadow: 0 0 2vh rgba(180, 140, 255, 0.9); }
+}
+
+/* Name tags, positioned over each avatar every frame. */
+#tags, #banners {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.tag {
+  position: absolute;
+  left: 0;
+  top: 0;
+  padding: 0.6vh 1.6vh 0.7vh;
+  border-radius: 1.2vh;
+  border-bottom: 0.35vh solid var(--trim, var(--gold));
+  background: var(--panel);
+  text-align: center;
+  white-space: nowrap;
+  transition: opacity 0.6s;
+  will-change: transform;
+}
+
+.tag-name { font-size: 2.4vh; }
+.tag-sub { font-size: 1.7vh; color: var(--muted); }
+.tag.low .tag-sub { color: #ff9c8a; }
+.tag.resting { opacity: 0.6; }
+.tag.gone { opacity: 0; }
+
+/* Spell names rise out of the caster. */
+.banner {
+  position: absolute;
+  margin-top: -8vh; /* above the name tag */
+  transform: translateX(-50%);
+  font-size: 6vh;
+  font-style: italic;
+  color: #fff;
+  text-shadow: 0 0 1.5vh var(--trim, var(--gold)), 0 0 4vh var(--trim, var(--gold));
+  white-space: nowrap;
+  animation: rise 2.6s ease-out forwards;
+}
+
+@keyframes rise {
+  0% { opacity: 0; transform: translate(-50%, 3vh) scale(0.8); }
+  12% { opacity: 1; transform: translate(-50%, 0) scale(1.05); }
+  70% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-50%, -8vh) scale(1); }
+}
+
+#toast {
+  position: fixed;
+  top: 5vh;
+  right: 5vw;
+  max-width: 40vw;
+  padding: 1.2vh 2.4vh;
+  border-radius: 1.2vh;
+  background: var(--panel);
+  font-size: 2.2vh;
+  opacity: 0;
+  transform: translateY(-1vh);
+  transition: opacity 0.3s, transform 0.3s;
+  pointer-events: none;
+}
+
+#toast.show { opacity: 1; transform: none; }
+
+#version {
+  position: fixed;
+  right: 5vw;
+  bottom: 5vh;
+  font-size: 1.4vh;
+  color: rgba(185, 169, 221, 0.45);
+}

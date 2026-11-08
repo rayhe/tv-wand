@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 320x180 TV launcher banner: a pointed hat, a wand and a few stars. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path android:fillColor="#1A1033" android:pathData="M0,0h320v180h-320z" />
+    <path android:fillColor="#2B1B55" android:pathData="M0,120 Q160,70 320,120 L320,180 L0,180 Z" />
+    <!-- hat -->
+    <path android:fillColor="#5B3FC4" android:pathData="M70,128 L112,28 Q118,22 122,34 L150,128 Z" />
+    <path android:fillColor="#E2B75D" android:pathData="M78,114 L144,114 L147,124 L75,124 Z" />
+    <path android:fillColor="#3E2A8F" android:pathData="M40,128 Q110,112 180,128 Q110,142 40,128 Z" />
+    <!-- wand -->
+    <path android:fillColor="#6B4A30" android:pathData="M190,150 L272,52 L277,56 L198,156 Z" />
+    <path android:fillColor="#3B2A1E" android:pathData="M182,160 L204,136 L213,144 L191,168 Z" />
+    <path android:fillColor="#FFF2C0" android:pathData="M274.5,54 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0" />
+    <!-- stars -->
+    <path android:fillColor="#FFE9A8" android:pathData="M250,24 l3,8 8,3 -8,3 -3,8 -3,-8 -8,-3 8,-3z" />
+    <path android:fillColor="#FFE9A8" android:pathData="M296,78 l2,5 5,2 -5,2 -2,5 -2,-5 -5,-2 5,-2z" />
+    <path android:fillColor="#C9B8FF" android:pathData="M220,30 l1.5,4 4,1.5 -4,1.5 -1.5,4 -1.5,-4 -4,-1.5 4,-1.5z" />
+    <path android:fillColor="#C9B8FF" android:pathData="M40,40 l1.5,4 4,1.5 -4,1.5 -1.5,4 -1.5,-4 -4,-1.5 4,-1.5z" />
+    <path android:fillColor="#FFE9A8" android:pathData="M180,20 l2,5 5,2 -5,2 -2,5 -2,-5 -5,-2 5,-2z" />
+</vector>
