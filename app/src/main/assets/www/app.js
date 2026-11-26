@@ -7,7 +7,9 @@
 import { Stage } from './stage.js';
 import { Avatar, designFor } from './avatar.js';
 import { NativeWand, bridge, hexToBytes, nativeTransport, nullTransport } from './native-wand.js';
+import { startRelay } from './relay.js';
 import { MotionTracker } from './tracker.js';
+import { eulerOf } from './orientation.js';
 import { Macro, LED } from './wand.js';
 import { startDemo } from './demo.js';
 
@@ -19,6 +21,8 @@ const players = new Map(); // id -> Player
 const departing = new Set(); // players whose avatar is still animating out
 const connecting = new Map(); // id -> name, found but not ready yet
 let problem = null; // a native status that needs the viewer's attention
+let wandTransport = nativeTransport; // replaced by the relay when one is configured
+const relayUrl = new URLSearchParams(location.search).get('relay'); // ws://host:port, or null
 
 // Lights and buzz answered on the wand itself, from web-wand.
 const EFFECTS = {
@@ -48,10 +52,10 @@ const HOLD_POSE_MS = 20_000;
 const IMU_RESTART_MS = 6_000;
 
 class Player {
-  constructor(wand, { demo = false } = {}) {
+  constructor(wand, { demo = false, design = null } = {}) {
     this.wand = wand;
     this.demo = demo;
-    this.design = designFor(wand.name);
+    this.design = design ?? designFor(wand.name);
     this.avatar = new Avatar(this.design);
     this.tracker = new MotionTracker(demo ? null : wand.name);
     this.info = {};
@@ -70,7 +74,7 @@ class Player {
     wand.addEventListener('buttons', (e) => { this.avatar.casting = e.detail.all; });
     wand.addEventListener('spell', (e) => this.onSpell(e.detail.name));
     wand.addEventListener('battery', (e) => { this.battery = e.detail; this.renderTag(); });
-    wand.addEventListener('info', (e) => { this.info = e.detail; this.renderTag(); });
+    wand.addEventListener('info', (e) => { this.info = e.detail; this.renderTag(); dropDuplicate(this); });
     wand.addEventListener('connect', () => this.greet());
 
     stage.add(this.avatar);
@@ -79,12 +83,18 @@ class Player {
 
   async greet() {
     if (this.demo) return;
-    // Light the wand in its avatar's colour, so everyone can tell which one is theirs.
+    // Colour the wand up in its avatar's colour, tip to pommel, so everyone can
+    // see which one is theirs; then start the IMU stream.
+    const colour = hex6(this.design.trim);
+    const raise = new Macro().clear().buzz(120);
+    [LED.TIP, LED.MID_UPPER, LED.MID_LOWER, LED.POMMEL].forEach((group, i) => {
+      raise.ledHex(group, colour, 2200 - i * 200).delay(140);
+    });
     try {
-      await this.wand.runMacro(new Macro().buzz(120).ledHex(LED.TIP, hex6(this.design.trim), 1500).delay(1500).clear());
+      await this.wand.runMacro(raise.delay(1200).clear());
       await this.wand.startImu();
-    } catch {
-      // Dropped while greeting; the disconnect event tidies up.
+    } catch (err) {
+      console.log(`greet failed for ${this.design.name}: ${err}`);
     }
   }
 
@@ -108,6 +118,8 @@ class Player {
     const t = this.tracker;
     const holding = t.filter.ready && performance.now() - t.lastSampleAt < HOLD_POSE_MS;
     this.avatar.update(dt, holding ? t.q : null);
+    // The character faces the viewer and leans a little into where the wand points.
+    this.avatar.yawHint = t.filter.ready ? eulerOf(t.q).yaw : 0;
     if (this.avatar.casting) stage.trail(this.avatar);
 
     const p = stage.project(this.avatar.tagAnchor());
@@ -183,18 +195,44 @@ function renderStatus() {
     main.textContent = `${n} ${n === 1 ? 'wand' : 'wands'} in the circle`;
     sub.textContent = connecting.size
       ? `Summoning ${[...connecting.values()].join(', ')}…`
-      : 'Wake another wand to join  ·  Point at the TV and press OK to re-centre';
+      : 'Wake another wand to join  ·  Heading drift is corrected automatically';
   }
   document.body.classList.toggle('empty', n === 0);
+  // Past a handful of characters the name tags would cover the whole screen.
+  document.body.classList.toggle('crowded', n > 8);
 }
 
 // ---------- Native events ----------
 
+/** A design whose name nobody in the circle has yet: collisions re-roll with a salt. */
+function freshDesign(name) {
+  const taken = new Set([...players.values()].map((p) => p.design.name));
+  let design = designFor(name);
+  for (let i = 2; taken.has(design.name) && i < 32; i++) design = designFor(`${name}#${i}`);
+  return design;
+}
+
+/** A wand's BLE address rotates, so one wand can join the circle twice. The serial is stable. */
+function dropDuplicate(player) {
+  const serial = player.info && player.info.serial;
+  if (!serial) return;
+  for (const other of players.values()) {
+    if (other === player) continue;
+    if (other.info && String(other.info.serial) === String(serial)) {
+      toast(`${player.design.name} is the same wand twice — releasing the newer link`);
+      player.wand.disconnect?.();
+      removeWand(player.wand.id);
+      renderStatus();
+      return;
+    }
+  }
+}
+
 function addNativeWand(id, name) {
   connecting.delete(id);
   if (players.has(id)) return;
-  const wand = new NativeWand(id, name, nativeTransport);
-  const player = new Player(wand);
+  const wand = new NativeWand(id, name, wandTransport);
+  const player = new Player(wand, { design: freshDesign(wand.name) });
   players.set(id, player);
   wand.open().catch(() => {});
 }
@@ -210,7 +248,7 @@ function removeWand(id) {
 
 const handlers = {
   status(ev) {
-    problem = ev.code === 'scanning' ? null : ev.text;
+    problem = (ev.code === 'scanning' || ev.code === 'relay') ? null : ev.text;
     renderStatus();
   },
   found(ev) {
@@ -222,6 +260,12 @@ const handlers = {
     renderStatus();
   },
   notify(ev) {
+    const s = statFor(ev.id);
+    s.times.push(performance.now());
+    s.bytes += ev.hex.length >> 1;
+    s.last = performance.now();
+    const kind = ev.hex.slice(0, 2);
+    s.kinds.set(kind, (s.kinds.get(kind) || 0) + 1);
     players.get(ev.id)?.wand.inject(hexToBytes(ev.hex));
   },
   battery(ev) {
@@ -264,7 +308,14 @@ function addDemo() {
   renderStatus();
 }
 
+/** Demo wizards exist for the desktop preview and for explicit ?demo, nothing else. */
+function demosAllowed() {
+  if (new URLSearchParams(location.search).has('demo')) return true;
+  return !bridge && !relayUrl;
+}
+
 function toggleDemo() {
+  if (!demosAllowed()) return;
   const demos = [...players.entries()].filter(([, p]) => p.demo);
   if (demos.length) {
     for (const [id] of demos) removeWand(id);
@@ -278,7 +329,7 @@ function toggleDemo() {
 
 function onKey(key) {
   if (key === 'center') recenterAll();
-  else if (key === 'menu') toggleDemo();
+  else if (key === 'menu' && demosAllowed()) toggleDemo();
 }
 
 // Keyboard equivalents, for testing in a desktop browser.
@@ -287,9 +338,120 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'm' || e.key === 'ContextMenu') onKey('menu');
 });
 
+// Touchscreens (Portal and similar): tap re-centres where there is no remote or
+// keyboard. Deliberately nothing else — a stray long press should not change
+// what is on screen.
+{
+  let downAt = 0;
+  window.addEventListener('touchstart', () => { downAt = Date.now(); }, { passive: true });
+  window.addEventListener('touchend', (e) => {
+    if (!downAt) return;
+    if (e.touches.length === 0 && Date.now() - downAt < 600) onKey('center');
+    downAt = 0;
+  }, { passive: true });
+  window.addEventListener('touchcancel', () => { downAt = 0; }, { passive: true });
+}
+
+// ---------- Telemetry ----------
+
+// Per-wand receive stats, for the debug panel. Nothing here is needed to play.
+const stats = new Map(); // id -> {times, bytes, kinds, last, seenBytes, seenAt, bps}
+let frames = 0;
+let fps = 0;
+
+function statFor(id) {
+  let s = stats.get(id);
+  if (!s) {
+    s = { times: [], bytes: 0, kinds: new Map(), last: 0, seenBytes: 0, seenAt: 0, bps: 0 };
+    stats.set(id, s);
+  }
+  return s;
+}
+
+const telemetry = $('#telemetry');
+
+function setTelemetry(on) {
+  telemetry.hidden = on === undefined ? !telemetry.hidden : !on;
+  if (telemetry.hidden) return;
+  refreshTelemetry();
+}
+
+const deg = (rad) => `${(rad * 180 / Math.PI).toFixed(0)}°`;
+
+function refreshTelemetry() {
+  if (telemetry.hidden) return;
+  const now = performance.now();
+  const rows = [];
+
+  const linkName = relayUrl ? relayUrl.replace(/^wss?:\/\//, '') : bridge ? 'native BLE' : 'desktop preview';
+  const relay = window.__relayStats;
+  const linkState = relayUrl
+    ? (relay?.connected ? '<span class="ok">up</span>' : '<span class="warn">down</span>')
+    : (bridge ? '<span class="ok">up</span>' : '<span class="dim">—</span>');
+  rows.push(`link    <span class="dim">${linkName}</span> ${linkState}`);
+  if (relayUrl && relay) rows.push(`relay   ${relay.messages} msgs${relay.lastAt ? ` · ${((now - relay.lastAt) / 1000).toFixed(1)}s ago` : ''}`);
+  rows.push(`scene   ${players.size} wand${players.size === 1 ? '' : 's'} · ${fps} fps`);
+
+  for (const [id, p] of players) {
+    const s = stats.get(id);
+    const name = p.design.name;
+    if (p.demo) {
+      rows.push(`<div class="wand"><span class="name">${name}</span>\n<span class="dim">demo wand — no packets</span></div>`);
+      continue;
+    }
+
+    // Packets and bytes per second, over a sliding second.
+    if (s) {
+      while (s.times.length && now - s.times[0] > 1000) s.times.shift();
+      if (!s.seenAt) {
+        s.seenAt = now;
+        s.seenBytes = s.bytes;
+      } else if (now - s.seenAt >= 1000) {
+        s.bps = Math.round((s.bytes - s.seenBytes) * 1000 / (now - s.seenAt));
+        s.seenAt = now;
+        s.seenBytes = s.bytes;
+      }
+    }
+
+    const rate = s ? `${s.times.length} pkt/s` : 'no packets';
+    const age = s && s.last ? `${((now - s.last) / 1000).toFixed(2)}s` : '—';
+    const batt = p.battery ? `${p.battery.level}%${p.battery.state === 'charging' ? ' ⚡' : ''}` : '—';
+    const info = p.info || {};
+    const meta = [info.wandType && info.wandType !== 'Unknown' ? info.wandType : null,
+                  info.firmware ? `fw ${info.firmware}` : null,
+                  info.serial ? `sn ${info.serial}` : null].filter(Boolean).join(' · ') || 'no device info yet';
+
+    const e = eulerOf(p.tracker.q);
+    const tilt = `tilt ${deg(e.pitch)} yaw ${deg(e.yaw)} roll ${deg(e.roll)}`;
+    const kinds = s && s.kinds.size
+      ? [...s.kinds.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `0x${k}×${n}`).join(' ')
+      : '—';
+
+    rows.push(`<div class="wand"><span class="name">${name}</span> <span class="dim">${id}</span>
+<span>${rate} · ${s ? s.bps : 0} B/s · last ${age} · batt ${batt}</span>
+<span class="dim">${meta}</span>
+<span class="dim">${tilt} · ${kinds}</span></div>`);
+  }
+
+  $('#telemetry-body').innerHTML = rows.join('\n');
+}
+
+// Tap the version label, or press T, to show or hide the panel.
+$('#version').addEventListener('click', () => setTelemetry());
+window.addEventListener('keydown', (e) => {
+  if (e.key === 't' || e.key === 'T') setTelemetry();
+});
+setInterval(() => {
+  fps = frames;
+  frames = 0;
+  refreshTelemetry();
+}, 1000);
+if (new URLSearchParams(location.search).has('telemetry')) setTelemetry(true);
+
 // ---------- Run ----------
 
 stage.onFrame((dt) => {
+  frames++;
   for (const p of players.values()) p.frame(dt);
   for (const p of departing) {
     p.avatar.update(dt, null);
@@ -302,7 +464,14 @@ setInterval(() => { for (const p of players.values()) p.watchdog(); }, 2000);
 window.wandCircle = { stage, players };
 
 renderStatus();
-if (bridge) {
+// ?demowands=N stands in N demo wizards, handy for checking the layout of a crowd.
+const extraDemos = Number(new URLSearchParams(location.search).get('demowands') || 0);
+if (extraDemos > 0) for (let i = 0; i < Math.min(extraDemos, 24); i++) setTimeout(addDemo, i * 150);
+if (relayUrl) {
+  // Wands are reached through a relay host; this device's own radio is left alone.
+  if (bridge) $('#version').textContent = `v${bridge.version()}`;
+  wandTransport = startRelay(relayUrl);
+} else if (bridge) {
   $('#version').textContent = `v${bridge.version()}`;
   bridge.ready();
 } else {

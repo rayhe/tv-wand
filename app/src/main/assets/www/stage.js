@@ -4,7 +4,9 @@
 import * as THREE from 'three';
 import { glowMap, hashString } from './avatar.js';
 
-const SPACING = 1.75; // metres between avatars
+const SPACING = 1.75; // metres between neighbours, at the front of the arc
+const ARC_RADIUS = 3.6; // how far back the arc curves at small head counts
+const MAX_ARC = 1.8; // radians of arc before the radius grows instead (~103°)
 const CAMERA_FOV = 36;
 
 // ---------- Particles: one shared additive point cloud ----------
@@ -371,9 +373,22 @@ export class Stage {
 
   // ---------- Layout ----------
 
+  /**
+   * Where avatar i of n stands: on a circular arc around the middle of the
+   * circle, so the group fans out as wands join. Up to a handful of wands the
+   * arc is shallow; past that it widens to MAX_ARC and then pushes its radius
+   * out, keeping everyone's gap the same so no head count overlaps or marches
+   * off screen.
+   */
   _slot(i, n) {
-    const x = (i - (n - 1) / 2) * SPACING;
-    return { x, z: -0.07 * x * x };
+    if (n <= 1) return { x: 0, z: 0 };
+    const span = Math.min(MAX_ARC, ((n - 1) * SPACING) / ARC_RADIUS);
+    const radius = ((n - 1) * SPACING) / span;
+    // Even steps of sin(a), not of a: the arc's ends foreshorten on screen, so
+    // spacing by angle piles neighbours up at the edges of the frame.
+    const s = Math.sin(span / 2);
+    const sinA = -s + (2 * s * i) / (n - 1);
+    return { x: radius * sinA, z: radius * (Math.sqrt(1 - sinA * sinA) - 1) };
   }
 
   _layout(dt) {
@@ -384,18 +399,24 @@ export class Stage {
       const { x, z } = this._slot(i, n);
       a.root.position.x += (x - a.root.position.x) * k;
       a.root.position.z += (z - a.root.position.z) * k;
-      // Turn partly towards the camera.
-      const face = Math.atan2(this.camera.position.x - a.root.position.x, this.camera.position.z - a.root.position.z) * 0.85;
-      a.root.rotation.y += (face - a.root.rotation.y) * k;
+      // Turn to face the viewer. Where the avatar stands in the arc doesn't
+      // matter, so any number of characters read as a group looking out; the
+      // body then swings with its own wand, so pointing across the room turns
+      // the character instead of only their arm.
+      const facing = Math.atan2(this.camera.position.x - a.root.position.x, this.camera.position.z - a.root.position.z);
+      const hint = THREE.MathUtils.clamp(a.yawHint || 0, -0.8, 0.8) * 0.85;
+      const look = facing + hint;
+      a.root.rotation.y += (look - a.root.rotation.y) * (1 - Math.exp(-dt * 3.5));
     });
 
     // Pull the camera back far enough for everyone (plus room for spells).
-    const halfWidth = Math.max(1, ((n - 1) / 2) * SPACING + 1.1);
+    let halfWidth = 1.1;
+    for (let i = 0; i < n; i++) halfWidth = Math.max(halfWidth, Math.abs(this._slot(i, n).x) + 1.1);
     const vfov = THREE.MathUtils.degToRad(CAMERA_FOV);
     const hfov = 2 * Math.atan(Math.tan(vfov / 2) * this.camera.aspect);
     const dist = Math.max(4.8, halfWidth / Math.tan(hfov / 2) + 0.6);
     const sway = Math.sin(this.time * 0.11) * 0.25;
-    this.camPos.set(sway, 1.45 + dist * 0.06, dist);
+    this.camPos.set(sway, 1.45 + dist * 0.09, dist);
     this.camera.position.lerp(this.camPos, 1 - Math.exp(-dt * 1.5));
     this.lookAt.set(0, 1.15, 0);
     this.camera.lookAt(this.lookAt);

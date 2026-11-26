@@ -13,6 +13,7 @@ import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothStatusCodes;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
@@ -26,13 +27,18 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelUuid;
 import android.os.SystemClock;
+import android.util.Log;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -64,8 +70,9 @@ final class WandManager {
     static final UUID BATTERY_LEVEL = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb");
     static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
     static final String NAME_PREFIX = "MCW-";
+    private static final String TAG = "WandCircle";
 
-    private static final int MAX_WANDS = 7; // a typical controller's LE connection limit
+    private static final int MAX_WANDS = 16; // a controller's LE link limit is lower; a relay's is not
     private static final int MTU = 517; // IMU packets are longer than the default 23-byte MTU allows
     private static final long CONNECT_TIMEOUT_MS = 15_000;
     private static final long OP_TIMEOUT_MS = 3_000;
@@ -87,15 +94,52 @@ final class WandManager {
     private boolean scanning;
     private boolean receiverRegistered;
 
+    /**
+     * Wands to reach by address when the scanner is dead. The Meta Portal's
+     * Bluetooth stack cannot scan at all (every startScan fails
+     * SCAN_FAILED_INTERNAL_ERROR), but a direct connect still works, so a wand
+     * whose address is known can be connected without ever discovering it.
+     */
+    private final Set<String> known = new LinkedHashSet<>();
+
+    private static final String PREFS = "wandcircle";
+    private static final String PREF_KNOWN = "knownWands";
+    private static final long KNOWN_PUMP_MS = 10_000;
+    private static final long KNOWN_RETRY_MS = 20_000;
+
     WandManager(Context ctx, Listener listener) {
         this.ctx = ctx.getApplicationContext();
         this.listener = listener;
         BluetoothManager bm = ctx.getSystemService(BluetoothManager.class);
         this.adapter = bm == null ? null : bm.getAdapter();
+        known.addAll(ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(PREF_KNOWN, Collections.emptySet()));
+    }
+
+    /** Remember a wand's address (AA:BB:CC:DD:EE:FF) and connect to it now. */
+    void addKnown(String mac) {
+        if (mac == null) return;
+        String id = mac.trim().toUpperCase(Locale.US);
+        if (!id.matches("([0-9A-F]{2}:){5}[0-9A-F]{2}")) {
+            listener.onStatus("bad-address", "Not a Bluetooth address: " + mac);
+            return;
+        }
+        if (known.add(id)) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                    .putStringSet(PREF_KNOWN, known).apply();
+        }
+        listener.onStatus("known-wand", "Connecting to " + id);
+        if (running) pumpKnown();
+    }
+
+    Set<String> knownWands() {
+        return new LinkedHashSet<>(known);
     }
 
     boolean bluetoothAvailable() {
-        return adapter != null && ctx.getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE);
+        // Some devices (Meta Portal, for one) run a full BLE stack without
+        // declaring android.hardware.bluetooth_le, so the adapter is the test.
+        return adapter != null;
     }
 
     boolean bluetoothEnabled() {
@@ -113,6 +157,7 @@ final class WandManager {
         }
         receiverRegistered = true;
         if (adapter.isEnabled()) startScan();
+        if (adapter.isEnabled()) pumpKnown();
     }
 
     void stop() {
@@ -126,6 +171,39 @@ final class WandManager {
         dropAll();
         main.removeCallbacksAndMessages(null);
     }
+
+    /**
+     * Try each remembered wand in turn. One connection is opened at a time, for
+     * the same reason scanning connects one at a time, and a wand that is asleep
+     * simply fails and is retried on a later pass.
+     */
+    private void pumpKnown() {
+        main.removeCallbacks(knownPump);
+        if (!running || !adapter.isEnabled()) return;
+        main.postDelayed(knownPump, KNOWN_PUMP_MS);
+        if (connecting != null || wands.size() >= MAX_WANDS) return;
+        for (String id : known) {
+            if (wands.containsKey(id)) continue;
+            Long after = retryAfter.get(id);
+            if (after != null && SystemClock.elapsedRealtime() < after) continue;
+            BluetoothDevice device;
+            try {
+                device = adapter.getRemoteDevice(id);
+            } catch (IllegalArgumentException e) {
+                continue;
+            }
+            Wand w = new Wand(device, NAME_PREFIX + id.replace(":", "").substring(6), KNOWN_RETRY_MS);
+            Log.i(TAG, "probe: known connect " + id);
+            wands.put(id, w);
+            listener.onStatus("known-wand", "Connecting to " + id);
+            listener.onFound(w.id, w.name);
+            connectQueue.add(w);
+            pumpConnections();
+            return;
+        }
+    }
+
+    private final Runnable knownPump = this::pumpKnown;
 
     /** Re-announce connected wands, for a page that just (re)loaded. */
     void replay() {
@@ -144,24 +222,61 @@ final class WandManager {
 
     // ---------- Scanning ----------
 
+    /**
+     * Scan configurations to try in order. Some stacks (Meta Portal's, for one)
+     * reject a filterless low-latency scan with SCAN_FAILED_INTERNAL_ERROR and
+     * accept something else, so fall through until one starts.
+     */
+    private static final int[][] VARIANTS = {
+            {ScanSettings.SCAN_MODE_LOW_LATENCY, 0, 1},
+            {ScanSettings.SCAN_MODE_LOW_POWER, 0, 1},
+            {ScanSettings.SCAN_MODE_LOW_LATENCY, 1, 1},
+            {ScanSettings.SCAN_MODE_BALANCED, 0, 1},
+            {ScanSettings.SCAN_MODE_LOW_LATENCY, 0, 0},
+    };
+    private int variant;
+    private int scanFailures;
+
     private void startScan() {
         if (!running || scanning || !adapter.isEnabled()) return;
         BluetoothLeScanner scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
+            Log.i(TAG, "probe: no BluetoothLeScanner yet");
             main.postDelayed(this::startScan, SCAN_RETRY_MS);
             return;
         }
+        int[] v = VARIANTS[variant % VARIANTS.length];
         ScanSettings settings = new ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setScanMode(v[0])
                 .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .setLegacy(v[2] == 1)
                 .build();
-        // No filter: wands advertise their MCW- name but not always the service UUID,
-        // and there is no name-prefix filter.
-        scanner.startScan(null, settings, scanCallback);
+        List<ScanFilter> filters = null;
+        if (v[1] == 1) {
+            filters = new ArrayList<>();
+            filters.add(new ScanFilter.Builder().setServiceUuid(new ParcelUuid(SERVICE)).build());
+        }
+        Log.i(TAG, "probe: startScan variant=" + variant + " mode=" + v[0]
+                + " filters=" + v[1] + " legacy=" + v[2]
+                + " offloadFilters=" + adapter.isOffloadedFilteringSupported()
+                + " offloadBatch=" + adapter.isOffloadedScanBatchingSupported()
+                + " multiAdv=" + adapter.isMultipleAdvertisementSupported());
+        try {
+            scanner.startScan(filters, settings, scanCallback);
+        } catch (RuntimeException e) {
+            Log.i(TAG, "probe: startScan threw " + e);
+            nextVariant();
+            return;
+        }
         scanning = true;
         listener.onStatus("scanning", "Looking for wands");
         main.removeCallbacks(restartScan);
         main.postDelayed(restartScan, SCAN_RESTART_MS);
+    }
+
+    private void nextVariant() {
+        variant = (variant + 1) % VARIANTS.length;
+        main.postDelayed(this::startScan, SCAN_RETRY_MS);
     }
 
     private void stopScan() {
@@ -190,9 +305,19 @@ final class WandManager {
 
         @Override
         public void onScanFailed(int errorCode) {
+            Log.i(TAG, "probe: scan failed code=" + errorCode + " variant=" + variant);
             scanning = false;
+            scanFailures++;
+            if (scanFailures > VARIANTS.length) {
+                // Every configuration failed: this stack cannot scan at all.
+                // Keep the retries slow, and lean on known wand addresses instead.
+                listener.onStatus("no-scan", "This device cannot scan for Bluetooth, so wands are reached by address");
+                main.removeCallbacks(restartScan);
+                main.postDelayed(WandManager.this::startScan, 60_000);
+                return;
+            }
             listener.onStatus("scan-failed", "Bluetooth scan failed (" + errorCode + "), retrying");
-            main.postDelayed(WandManager.this::startScan, SCAN_RETRY_MS);
+            nextVariant();
         }
     };
 
@@ -263,6 +388,7 @@ final class WandManager {
         BluetoothGatt gatt;
         BluetoothGattCharacteristic command;
         int writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+        long retryMs = RETRY_COOLDOWN_MS;
         boolean ready;
         boolean closed;
 
@@ -275,9 +401,14 @@ final class WandManager {
         private final Runnable connectTimeout = this::drop;
 
         Wand(BluetoothDevice device, String name) {
+            this(device, name, RETRY_COOLDOWN_MS);
+        }
+
+        Wand(BluetoothDevice device, String name, long retryMs) {
             this.device = device;
             this.id = device.getAddress();
             this.name = name;
+            this.retryMs = retryMs;
         }
 
         void connect() {
@@ -302,7 +433,7 @@ final class WandManager {
             }
             wands.remove(id);
             connectQueue.remove(this);
-            retryAfter.put(id, SystemClock.elapsedRealtime() + RETRY_COOLDOWN_MS);
+            retryAfter.put(id, SystemClock.elapsedRealtime() + retryMs);
             listener.onDisconnected(id);
             if (wasConnecting) {
                 connecting = null;
@@ -418,6 +549,7 @@ final class WandManager {
 
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            Log.i(TAG, "probe: conn state " + id + " status=" + status + " new=" + newState);
             main.post(() -> {
                 if (closed) return;
                 if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {

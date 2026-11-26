@@ -98,6 +98,11 @@ body.empty #status-main { animation: glow 2.4s ease-in-out infinite; }
 .tag.resting { opacity: 0.6; }
 .tag.gone { opacity: 0; }
 
+/* A crowd: keep the names, drop the second line and tighten up. */
+body.crowded .tag-sub { display: none; }
+body.crowded .tag-name { font-size: 1.9vh; }
+body.crowded .tag { padding: 0.4vh 1.1vh 0.5vh; }
+
 /* Spell names rise out of the caster. */
 .banner {
   position: absolute;
@@ -142,3 +147,45 @@ body.empty #status-main { animation: glow 2.4s ease-in-out infinite; }
   font-size: 1.4vh;
   color: rgba(185, 169, 221, 0.45);
 }
+
+/* Telemetry: a debug panel, off by default. Tap the version label or press T. */
+#telemetry {
+  position: fixed;
+  left: 5vw;
+  bottom: 5vh;
+  max-width: 46vw;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 1.2vh 2vh 1.4vh;
+  border-radius: 1.2vh;
+  border-left: 0.35vh solid var(--gold);
+  background: rgba(8, 5, 20, 0.82);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 1.6vh;
+  line-height: 1.55;
+  white-space: pre;
+  color: #cfc4e8;
+}
+
+#telemetry[hidden] { display: none; }
+
+#telemetry h2 {
+  margin: 0 0 0.8vh;
+  font-family: var(--serif);
+  font-size: 1.8vh;
+  font-weight: normal;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+#telemetry .wand {
+  margin-top: 0.9vh;
+  padding-top: 0.7vh;
+  border-top: 1px solid rgba(185, 169, 221, 0.18);
+}
+
+#telemetry .name { color: var(--ink); }
+#telemetry .dim { color: rgba(185, 169, 221, 0.6); }
+#telemetry .warn { color: #ff9c8a; }
+#telemetry .ok { color: #8ae6a8; }

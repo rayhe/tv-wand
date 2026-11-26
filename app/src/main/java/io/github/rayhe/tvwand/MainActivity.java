@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
@@ -38,7 +39,11 @@ import java.util.List;
 public final class MainActivity extends Activity implements WandManager.Listener {
     /** Served from assets/www. A real https origin keeps ES modules and localStorage working. */
     private static final String ORIGIN_HOST = "appassets.androidplatform.net";
-    private static final String START_URL = "https://" + ORIGIN_HOST + "/index.html";
+    /**
+     * http, not https: Chromium blocks ws:// from an https page as mixed content
+     * even with setMixedContentMode, which would break the wand relay.
+     */
+    private static final String START_URL = "http://" + ORIGIN_HOST + "/index.html";
     private static final int REQ_PERMISSIONS = 1;
     private static final int REQ_ENABLE_BT = 2;
     private static final long FLUSH_MS = 16;
@@ -47,6 +52,9 @@ public final class MainActivity extends Activity implements WandManager.Listener
     private WandManager wands;
     private boolean pageReady;
     private boolean permitted;
+    private String relay; // ws://host:port when wands come from a relay host
+    private boolean showTelemetry;
+    private String extraQuery; // raw extra query parameters, e.g. demowands=10
 
     // Events are batched to one evaluateJavascript call per frame: IMU packets
     // from several wands would otherwise flood the UI thread.
@@ -65,16 +73,86 @@ public final class MainActivity extends Activity implements WandManager.Listener
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setAllowFileAccess(false);
+        // A relay is plain ws:// on the LAN while the page is https://, which Chromium
+        // would otherwise block as mixed content.
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         web.setBackgroundColor(0xFF0B0820);
         web.setFocusable(true);
         web.setWebViewClient(new AssetClient());
+        web.setWebChromeClient(new android.webkit.WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(android.webkit.ConsoleMessage m) {
+                Log.i("WandConsole", m.message() + " @" + m.sourceId() + ":" + m.lineNumber());
+                return true;
+            }
+        });
         web.addJavascriptInterface(new Bridge(), "TvWandNative");
         setContentView(web);
         hideSystemUi();
 
         wands = new WandManager(this, this);
-        web.loadUrl(START_URL);
+        applyFlags(getIntent());
+        applyWandExtras(getIntent());
+        web.loadUrl(startUrl());
         requestBluetoothPermissions();
+    }
+
+    /** The scene, plus ?relay=... when wands arrive over the network instead. */
+    private String startUrl() {
+        StringBuilder url = new StringBuilder(START_URL);
+        char sep = '?';
+        if (relay != null && !relay.isEmpty()) {
+            url.append(sep).append("relay=").append(Uri.encode(relay));
+            sep = '&';
+        }
+        if (showTelemetry) {
+            url.append(sep).append("telemetry=1");
+            sep = '&';
+        }
+        if (extraQuery != null && !extraQuery.isEmpty()) url.append(sep).append(extraQuery);
+        return url.toString();
+    }
+
+    private void applyFlags(Intent intent) {
+        if (intent == null) return;
+        String extra = intent.getStringExtra("relay");
+        if (extra != null) {
+            relay = extra.trim().isEmpty() ? null : extra.trim();
+            getSharedPreferences("wandcircle", MODE_PRIVATE).edit()
+                    .putString("relay", relay == null ? "" : relay).apply();
+        } else {
+            String saved = getSharedPreferences("wandcircle", MODE_PRIVATE).getString("relay", "");
+            relay = saved == null || saved.isEmpty() ? null : saved;
+        }
+        if (intent.hasExtra("telemetry")) {
+            showTelemetry = intent.getBooleanExtra("telemetry", false);
+        }
+        String query = intent.getStringExtra("query");
+        if (query != null) extraQuery = query.trim();
+    }
+
+    /** Wands can be handed to the app on launch: adb shell am start ... --es wand AA:BB:.. */
+    private void applyWandExtras(Intent intent) {
+        if (intent == null) return;
+        String single = intent.getStringExtra("wand");
+        if (single != null) {
+            for (String mac : single.split("[,;\\s]+")) wands.addKnown(mac);
+        }
+        String many = intent.getStringExtra("wands");
+        if (many != null) {
+            for (String mac : many.split("[,;\\s]+")) wands.addKnown(mac);
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        String before = relay;
+        boolean telemetryBefore = showTelemetry;
+        applyFlags(intent);
+        applyWandExtras(intent);
+        if (!java.util.Objects.equals(before, relay) || telemetryBefore != showTelemetry) web.loadUrl(startUrl());
     }
 
     private void hideSystemUi() {
@@ -95,6 +173,7 @@ public final class MainActivity extends Activity implements WandManager.Listener
     }
 
     private void requestBluetoothPermissions() {
+        if (relay != null) return; // the relay host does the Bluetooth work
         List<String> missing = new ArrayList<>();
         for (String p : neededPermissions()) {
             if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) missing.add(p);
@@ -119,9 +198,10 @@ public final class MainActivity extends Activity implements WandManager.Listener
 
     @SuppressWarnings("MissingPermission")
     private void maybeStart() {
+        if (relay != null) return; // wands come over the network, not this radio
         if (!pageReady || !permitted) return;
         if (!wands.bluetoothAvailable()) {
-            onStatus("no-bluetooth", "This TV has no Bluetooth LE adapter.");
+            onStatus("no-bluetooth", "This device has no Bluetooth LE adapter.");
             return;
         }
         if (!wands.bluetoothEnabled()) {

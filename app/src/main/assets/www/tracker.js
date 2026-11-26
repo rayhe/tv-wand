@@ -11,6 +11,14 @@ import {
 const DEFAULT_ALIGNMENT = { tip: '+x', up: '+z' };
 const STORAGE_PREFIX = 'tv-wand-alignment:';
 
+// Automatic re-centring. A gyro's yaw bias accumulates, so a wand that is held
+// still slowly turns its avatar. While the wand is nearly still, "still" is
+// taken to mean "pointing forward" and the offset is pulled back at a slow,
+// steady rate — enough to undo drift, too slow to fight a deliberate pose.
+const STILL_RATE = 0.35; // rad/s of body motion that still counts as resting
+const STILL_MS = 1200; // how long it must rest before correcting
+const CORRECT_RATE = 0.09; // rad/s the heading is pulled back (about 5°/s)
+
 function load(key) {
   if (!key) return null;
   try {
@@ -40,6 +48,9 @@ export class MotionTracker {
     this.rate = 0; // body-frame angular speed of the latest sample, rad/s
     this.period = 0.01; // seconds per sample, re-measured every second
     this.lastSampleAt = 0;
+    this.autoRecenter = true;
+    this._stillMs = 0;
+    this._lastPushAt = 0;
     this._count = 0;
     this._windowStart = performance.now();
   }
@@ -71,6 +82,17 @@ export class MotionTracker {
       }
       this.rate = Math.hypot(...gyro);
     }
+    this.q = quatMultiply(quatFromYaw(this.yawOffset), this.filter.q);
+
+    // Undo yaw drift whenever the wand is resting (see CORRECT_RATE above).
+    const dt = this._lastPushAt ? Math.max(0, (now - this._lastPushAt) / 1000) : 0;
+    this._lastPushAt = now;
+    if (!this.autoRecenter || this.recenterNext || !this.filter.ready || dt <= 0) return;
+    this._stillMs = this.rate < STILL_RATE ? this._stillMs + dt * 1000 : 0;
+    if (this._stillMs < STILL_MS) return;
+    const yaw = eulerOf(this.q).yaw;
+    const step = Math.sign(yaw) * Math.min(Math.abs(yaw), CORRECT_RATE * dt);
+    this.yawOffset -= step;
     this.q = quatMultiply(quatFromYaw(this.yawOffset), this.filter.q);
   }
 

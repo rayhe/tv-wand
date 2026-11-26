@@ -1,0 +1,4 @@
+# Local installs and run artefacts
+.deps/
+__pycache__/
+*.log
